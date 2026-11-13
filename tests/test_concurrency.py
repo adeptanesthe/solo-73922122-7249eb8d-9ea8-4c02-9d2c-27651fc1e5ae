@@ -109,7 +109,7 @@ def test_paused_assembly_does_not_hold_write_lock(apis):
     def slow_batch():
         result["r"] = httpx.post(
             a + "/api/v1/batches",
-            params={"pause_ms": 1500},
+            params={"pause_ms": 2500},
             json={"points": [{"id": "P4", "lon": 116.400, "lat": 39.950}]},
             timeout=20,
         )
@@ -126,7 +126,9 @@ def test_paused_assembly_does_not_hold_write_lock(apis):
     )
     elapsed = time.time() - t0
     assert r.status_code == 201, r.text
-    assert elapsed < 1.2, f"ingest was blocked by the paused batch ({elapsed:.2f}s)"
+    # the batch pauses 2.5s without holding the write lock; a blocked writer
+    # would take ~2.5s, so this threshold leaves room for scheduling slack
+    assert elapsed < 1.4, f"ingest was blocked by the paused batch ({elapsed:.2f}s)"
 
     t.join(timeout=20)
     assert result["r"].status_code == 201

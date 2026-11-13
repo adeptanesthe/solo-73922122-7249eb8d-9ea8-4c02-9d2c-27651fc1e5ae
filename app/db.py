@@ -51,6 +51,19 @@ CREATE TABLE IF NOT EXISTS road_points (
 );
 CREATE INDEX IF NOT EXISTS idx_road_points_point ON road_points(point_id);
 
+-- Permanent aliases produced by point merges.  ``alias_id`` is the retired
+-- point number and ``canonical_id`` is the surviving point.  An alias row is
+-- never deleted or renamed to another alias: on a chained merge every alias
+-- of the absorbed point is re-pointed at the new survivor, so
+-- canonical_id always names a live row of ``points`` and no alias cycle can
+-- ever form.
+CREATE TABLE IF NOT EXISTS point_aliases (
+    alias_id        TEXT PRIMARY KEY,
+    canonical_id    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_point_aliases_canonical ON point_aliases(canonical_id);
+
 CREATE TABLE IF NOT EXISTS store_meta (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     generation  INTEGER NOT NULL

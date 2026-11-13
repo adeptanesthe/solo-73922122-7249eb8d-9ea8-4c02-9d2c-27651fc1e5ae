@@ -1,33 +1,47 @@
-"""Read/write orchestration for points and roads.
+"""Read/write orchestration for points, roads and point merges.
 
 Concurrency model
 -----------------
-A batch is *planned* from a WAL read snapshot and the (potentially slow)
-assembly runs with **no database lock at all**.  The plan is then committed in
-one short ``BEGIN IMMEDIATE`` transaction that first re-checks the store
-generation.  If any other batch committed in the meantime the plan is
-discarded, nothing is written, and the batch is recomputed from a fresh
-snapshot.
+A mutating request (batch ingest or point merge) is *planned* from a WAL read
+snapshot and the (potentially slow) assembly runs with **no database lock at
+all**.  The plan is then committed in one short ``BEGIN IMMEDIATE``
+transaction that first re-checks the store generation.  If any other writer
+committed in the meantime the plan is discarded, nothing is written, and the
+request is recomputed from a fresh snapshot.
 
 Because ``BEGIN IMMEDIATE`` excludes every other writer until COMMIT, whoever
 commits second is guaranteed to have observed the first writer's rows.  So a
-road can never be written back from stale coordinates, and a road created
-concurrently can never be missed.  The recomputation is *bounded*: an
-unchanged road is never rewritten, and all touched roads are recomputed in the
-one transaction that changed their inputs.
+road can never be written back from stale coordinates, a road created
+concurrently can never be missed, and a merge can never resurrect a point that
+another merge just retired: every plan is rebuilt from the newest committed
+state before it is allowed to write.
+
+Merge / alias rules
+-------------------
+* A merge takes two **existing, non-alias** point ids.  The survivor keeps its
+  own coordinates; the absorbed point's road references are rewritten to the
+  survivor, the absorbed row is deleted and its id becomes a *permanent*
+  alias.  Aliases already owned by the absorbed point are re-pointed at the
+  survivor in the same transaction, so chained merges never create a cycle
+  and every alias always resolves to a live point.
+* Batch ingestion resolves aliases before planning.  Writing or deleting an
+  alias id, deleting a point that still owns aliases, or producing a
+  duplicated road reference after resolution are all rejected with **409 and
+  zero writes** - vertices are never auto-removed.
 """
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .config import settings
 from .db import read_tx, write_tx
 from .geometry import assemble as _assemble
-from .schemas import BatchIn, BatchResult, PointIn, RoadOut
+from .schemas import BatchIn, BatchResult, MergeIn, MergeResult, PointIn, RoadOut
 
 CHUNK = 400
 
@@ -42,6 +56,25 @@ class ConcurrentConflict(Exception):
 
 class DemoFailure(Exception):
     """Injected failure used to demonstrate transactional rollback."""
+
+
+class ConflictError(Exception):
+    """A 409 business conflict.  Nothing was or will be written."""
+
+    def __init__(self, error: str, message: str, point_ids=None, road_ids=None):
+        super().__init__(message)
+        self.error = error
+        self.message = message
+        self.point_ids = sorted(set(point_ids or []))
+        self.road_ids = sorted(set(road_ids or []))
+
+    def detail(self) -> dict:
+        return {
+            "error": self.error,
+            "message": self.message,
+            "point_ids": self.point_ids,
+            "road_ids": self.road_ids,
+        }
 
 
 def _chunks(ids: Iterable[str], size: int = CHUNK) -> Iterable[Sequence[str]]:
@@ -64,6 +97,30 @@ def _now() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Alias helpers
+# ---------------------------------------------------------------------------
+
+
+def load_aliases(conn) -> dict[str, str]:
+    """Return the full ``alias_id -> canonical_id`` mapping."""
+    return {
+        row["alias_id"]: row["canonical_id"]
+        for row in conn.execute("SELECT alias_id, canonical_id FROM point_aliases")
+    }
+
+
+def resolve_id(pid: str, aliases: Mapping[str, str] | None = None) -> str:
+    """Resolve one id through the alias map.
+
+    Alias rows always point straight at a live point (never at another alias),
+    so a single lookup is the full resolution; chains cannot exist.
+    """
+    if aliases is None:
+        return pid
+    return aliases.get(pid, pid)
+
+
+# ---------------------------------------------------------------------------
 # Snapshot
 # ---------------------------------------------------------------------------
 
@@ -75,6 +132,8 @@ class Snapshot:
     old_refs: dict[str, list[str]]
     roads: dict[str, dict]
     coords: dict[str, tuple[float, float]]
+    aliases: dict[str, str]
+    alias_owners: dict[str, list[str]]
 
 
 @dataclass
@@ -100,8 +159,13 @@ def _take_snapshot(conn, batch: BatchIn) -> Snapshot:
     generation = int(
         conn.execute("SELECT generation FROM store_meta WHERE id = 1").fetchone()[0]
     )
+    aliases = load_aliases(conn)
+    alias_owners: dict[str, list[str]] = {}
+    for alias_id, canonical_id in aliases.items():
+        alias_owners.setdefault(canonical_id, []).append(alias_id)
 
-    touched = {p.id for p in batch.points} | set(batch.delete_points)
+    touched_raw = {p.id for p in batch.points} | set(batch.delete_points)
+    touched = {resolve_id(pid, aliases) for pid in touched_raw}
     candidates = {r.id for r in batch.roads} | set(batch.delete_roads)
 
     old_points: dict[str, tuple[float, float]] = {}
@@ -122,6 +186,7 @@ def _take_snapshot(conn, batch: BatchIn) -> Snapshot:
             ):
                 candidates.add(row["road_id"])
 
+    # Persisted references only ever hold canonical ids.
     old_refs: dict[str, list[str]] = {rid: [] for rid in candidates}
     for chunk in _chunks(sorted(candidates)):
         marks = ",".join("?" * len(chunk))
@@ -151,7 +216,7 @@ def _take_snapshot(conn, batch: BatchIn) -> Snapshot:
     for refs in old_refs.values():
         needed.update(refs)
     for road in batch.roads:
-        needed.update(road.point_ids)
+        needed.update(resolve_id(pid, aliases) for pid in road.point_ids)
     coords: dict[str, tuple[float, float]] = {}
     for chunk in _chunks(sorted(needed)):
         marks = ",".join("?" * len(chunk))
@@ -166,19 +231,75 @@ def _take_snapshot(conn, batch: BatchIn) -> Snapshot:
         old_refs=old_refs,
         roads=roads,
         coords=coords,
+        aliases=aliases,
+        alias_owners=alias_owners,
     )
 
 
+def _raise_batch_conflicts(batch: BatchIn, snap: Snapshot) -> None:
+    """Validate every 409 rule against the planned snapshot.
+
+    Runs on every planning attempt, so the checks always reflect the newest
+    committed state; the request still writes nothing until the generation
+    guard inside the write transaction accepts this very plan.
+    """
+    aliases = snap.aliases
+    alias_point_ids: list[str] = []
+    blocked_deletes: list[str] = []
+
+    for p in batch.points:
+        if p.id in aliases:
+            alias_point_ids.append(p.id)
+    for pid in batch.delete_points:
+        if pid in aliases:
+            alias_point_ids.append(pid)
+        # a point that still owns permanent aliases must not be deleted
+        # directly - merging it is the only allowed path
+        elif pid in snap.alias_owners:
+            blocked_deletes.append(pid)
+
+    dup_roads: list[str] = []
+    for road in batch.roads:
+        resolved = [resolve_id(pid, aliases) for pid in road.point_ids]
+        if len(set(resolved)) != len(resolved):
+            dup_roads.append(road.id)
+
+    if alias_point_ids:
+        raise ConflictError(
+            "alias_id_conflict",
+            "retired alias ids can neither be written nor deleted; resolve them "
+            "to their canonical point first",
+            point_ids=alias_point_ids,
+        )
+    if blocked_deletes:
+        raise ConflictError(
+            "aliased_point_delete",
+            "a point that owns permanent aliases cannot be deleted directly; "
+            "merge it into another point instead",
+            point_ids=blocked_deletes,
+        )
+    if dup_roads:
+        raise ConflictError(
+            "duplicate_road_reference",
+            "resolving aliases would make a road reference the same point more "
+            "than once; no vertex is removed automatically",
+            road_ids=dup_roads,
+        )
+
+
 def _build_plan(batch: BatchIn, snap: Snapshot) -> Plan:
+    _raise_batch_conflicts(batch, snap)
+    aliases = snap.aliases
+
     points = dict(snap.coords)
     for p in batch.points:
-        points[p.id] = (p.lon, p.lat)
+        points[p.id] = (p.lon, p.lat)  # non-alias ids guaranteed by the check
     for pid in batch.delete_points:
         points.pop(pid, None)
 
     refs: dict[str, list[str]] = {rid: list(v) for rid, v in snap.old_refs.items()}
     for road in batch.roads:
-        refs[road.id] = list(road.point_ids)
+        refs[road.id] = [resolve_id(pid, aliases) for pid in road.point_ids]
     for rid in batch.delete_roads:
         refs.pop(rid, None)
 
@@ -224,7 +345,261 @@ def _build_plan(batch: BatchIn, snap: Snapshot) -> Plan:
 
 
 # ---------------------------------------------------------------------------
-# Commit
+# Point merge
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MergeSnapshot:
+    generation: int
+    keep_id: str
+    merged_id: str
+    keep_coord: tuple[float, float]
+    aliases: dict[str, str]
+    # road_id -> (current refs, planned refs, geometry-or-None, missing)
+    affected: dict[str, tuple[list[str], list[str], dict | None, list[str]]]
+    repointed_aliases: list[str]
+
+
+def _take_merge_snapshot(conn, merge: MergeIn) -> MergeSnapshot:
+    generation = int(
+        conn.execute("SELECT generation FROM store_meta WHERE id = 1").fetchone()[0]
+    )
+    aliases = load_aliases(conn)
+    keep_id, merged_id = merge.keep_point_id, merge.merged_point_id
+
+    keep_row = conn.execute(
+        "SELECT id, lon, lat FROM points WHERE id = ?", (keep_id,)
+    ).fetchone()
+    merged_row = conn.execute(
+        "SELECT id, lon, lat FROM points WHERE id = ?", (merged_id,)
+    ).fetchone()
+    # alias inputs are a distinct, permanent error class and take precedence
+    # over "point does not exist" (an alias row never has a points row)
+    alias_inputs = [pid for pid in (keep_id, merged_id) if pid in aliases]
+    if alias_inputs:
+        raise ConflictError(
+            "alias_id_conflict",
+            "merge inputs must be live points, not retired alias ids",
+            point_ids=alias_inputs,
+        )
+    missing = [
+        pid
+        for pid, row in ((keep_id, keep_row), (merged_id, merged_row))
+        if row is None
+    ]
+    if missing:
+        raise ConflictError(
+            "merge_conflict",
+            "both merge inputs must be existing non-alias point ids",
+            point_ids=missing,
+        )
+
+    # every road referencing the absorbed point - or one of its aliases - has
+    # to be rewritten.  Persisted references normally hold canonical ids, but
+    # a dangling reference created while the point was missing may name an
+    # alias number; resolving all of them keeps the invariant "stored
+    # references are always canonical" intact across chained merges.
+    absorbed_ids = sorted(
+        {merged_id}
+        | {alias_id for alias_id, canonical in aliases.items() if canonical == merged_id}
+    )
+    affected_ids: list[str] = []
+    for chunk in _chunks(absorbed_ids):
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT DISTINCT road_id FROM road_points WHERE point_id IN ({marks}) "
+            "ORDER BY road_id",
+            chunk,
+        ):
+            if row["road_id"] not in affected_ids:
+                affected_ids.append(row["road_id"])
+
+    refs_by_road: dict[str, list[str]] = {rid: [] for rid in affected_ids}
+    if affected_ids:
+        for chunk in _chunks(affected_ids):
+            marks = ",".join("?" * len(chunk))
+            for row in conn.execute(
+                f"SELECT road_id, point_id FROM road_points WHERE road_id IN ({marks}) "
+                "ORDER BY road_id, seq",
+                chunk,
+            ):
+                refs_by_road[row["road_id"]].append(row["point_id"])
+
+    # coordinates of every referenced point, for in-transaction assembly
+    needed = {keep_id, merged_id}
+    for refs in refs_by_road.values():
+        needed.update(refs)
+    coords: dict[str, tuple[float, float]] = {}
+    for chunk in _chunks(sorted(needed)):
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT id, lon, lat FROM points WHERE id IN ({marks})", chunk
+        ):
+            coords[row["id"]] = (row["lon"], row["lat"])
+    # post-merge state: the merged row is gone, every reference now resolves
+    # to the survivor, whose coordinates are unchanged.
+    coords.pop(merged_id, None)
+    coords[keep_id] = (keep_row["lon"], keep_row["lat"])
+
+    affected: dict[str, tuple[list[str], list[str], dict | None, list[str]]] = {}
+    dup_roads: list[str] = []
+    absorbed = set(absorbed_ids)
+    for rid in affected_ids:
+        current = refs_by_road[rid]
+        planned = [keep_id if pid in absorbed else pid for pid in current]
+        if len(set(planned)) != len(planned):
+            dup_roads.append(rid)
+            continue
+        geometry, missing_ids = _assemble(planned, coords)
+        affected[rid] = (current, planned, geometry, missing_ids)
+    if dup_roads:
+        raise ConflictError(
+            "duplicate_road_reference",
+            "the merge would make these roads reference the surviving point "
+            "more than once; the merge is rejected and no vertex is removed",
+            road_ids=dup_roads,
+        )
+
+    repointed_aliases = sorted(
+        alias_id for alias_id, canonical in aliases.items() if canonical == merged_id
+    )
+    return MergeSnapshot(
+        generation=generation,
+        keep_id=keep_id,
+        merged_id=merged_id,
+        keep_coord=(keep_row["lon"], keep_row["lat"]),
+        aliases=aliases,
+        affected=affected,
+        repointed_aliases=repointed_aliases,
+    )
+
+
+def _apply_merge(conn, snap: MergeSnapshot, stamp: str, inject_failure: bool) -> list[RoadOut]:
+    keep_id, merged_id = snap.keep_id, snap.merged_id
+
+    # Re-validate against the rows this transaction actually locked.  The
+    # generation guard already proves nothing changed since planning; these
+    # checks are the in-transaction invariant that makes merges crash-safe.
+    live = {
+        r["id"]
+        for r in conn.execute("SELECT id FROM points WHERE id IN (?, ?)", (keep_id, merged_id))
+    }
+    gone = [pid for pid in (keep_id, merged_id) if pid not in live]
+    if gone:
+        # another merge retired one of the inputs after our snapshot: replan
+        raise RetryPlanned()
+    alias_now = load_aliases(conn)
+    if keep_id in alias_now or merged_id in alias_now:
+        raise RetryPlanned()
+
+    # 1. rewrite every road reference merged_id -> keep_id, then recompute and
+    #    persist the affected geometry in the same transaction
+    out: list[RoadOut] = []
+    for rid in sorted(snap.affected):
+        current, planned, geometry, missing = snap.affected[rid]
+        try:
+            write_refs(conn, rid, current, planned)
+        except sqlite3.IntegrityError as exc:
+            # UNIQUE(road_id, point_id): duplicated reference at the SQL level
+            raise ConflictError(
+                "duplicate_road_reference",
+                "the merge would duplicate a road reference; rejected",
+                road_ids=[rid],
+            ) from exc
+        geom_text = json.dumps(geometry, separators=(",", ":")) if geometry else None
+        missing_text = json.dumps(missing, separators=(",", ":"))
+        revision = int(
+            conn.execute("SELECT revision FROM roads WHERE id = ?", (rid,)).fetchone()[0]
+        ) + 1
+        conn.execute(
+            "UPDATE roads SET geometry = ?, missing_point_ids = ?, revision = ?, "
+            "updated_at = ? WHERE id = ?",
+            (geom_text, missing_text, revision, stamp, rid),
+        )
+        out.append(
+            RoadOut(
+                id=rid,
+                point_ids=planned,
+                status="ok" if geometry else "incomplete",
+                geometry=geometry,
+                missing_point_ids=missing,
+                revision=revision,
+                updated_at=stamp,
+            )
+        )
+
+    # 2. aliases already owned by the absorbed point follow the merge (still
+    #    pointing at a live point, never at an alias -> no cycle possible)
+    for alias_id in snap.repointed_aliases:
+        conn.execute(
+            "UPDATE point_aliases SET canonical_id = ? WHERE alias_id = ?",
+            (keep_id, alias_id),
+        )
+
+    # 3. the absorbed number is retired permanently and its row removed.
+    #    No road_points row can still name it (step 1 rewrote them all), so
+    #    deleting it can never leave a dangling reference behind.
+    conn.execute(
+        "INSERT INTO point_aliases(alias_id, canonical_id, created_at) VALUES (?, ?, ?)",
+        (merged_id, keep_id, stamp),
+    )
+    conn.execute("DELETE FROM points WHERE id = ?", (merged_id,))
+
+    if inject_failure:
+        # Demo hook after every write, immediately before COMMIT.
+        raise DemoFailure("injected failure before commit; merge rolled back")
+
+    conn.execute("UPDATE store_meta SET generation = generation + 1 WHERE id = 1")
+    return out
+
+
+def execute_merge(
+    merge: MergeIn, *, pause_ms: int = 0, inject_failure: bool = False
+) -> tuple[MergeResult, int]:
+    """Plan, verify and commit a point merge.  Returns (result, attempts)."""
+    max_attempts = max(1, settings.max_commit_attempts)
+    for attempt in range(1, max_attempts + 1):
+        with read_tx() as conn:
+            snap = _take_merge_snapshot(conn, merge)
+
+        if attempt == 1 and pause_ms > 0:
+            # impact analysis / assembly happens outside any write lock
+            time.sleep(pause_ms / 1000.0)
+
+        stamp = _now()
+        try:
+            with write_tx() as conn:
+                current = int(
+                    conn.execute(
+                        "SELECT generation FROM store_meta WHERE id = 1"
+                    ).fetchone()[0]
+                )
+                if current != snap.generation:
+                    raise RetryPlanned()
+                roads_out = _apply_merge(conn, snap, stamp, inject_failure)
+        except RetryPlanned:
+            time.sleep(min(0.02 * attempt, 0.2))
+            continue
+
+        all_aliases = sorted(set(snap.repointed_aliases) | {merge.merged_point_id})
+        result = MergeResult(
+            keep_point_id=merge.keep_point_id,
+            merged_point_id=merge.merged_point_id,
+            new_alias_ids=all_aliases,
+            repointed_alias_ids=snap.repointed_aliases,
+            affected_road_ids=sorted(snap.affected),
+            roads=sorted(roads_out, key=lambda r: r.id),
+            commit_attempts=attempt,
+        )
+        return result, attempt
+    raise ConcurrentConflict(
+        f"could not commit merge after {max_attempts} attempts due to concurrent writes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Commit (batch)
 # ---------------------------------------------------------------------------
 
 
@@ -334,6 +709,8 @@ def execute_batch(
             # before any write lock is taken.  Other batches commit freely.
             time.sleep(pause_ms / 1000.0)
 
+        # ConflictError propagates: it was evaluated against this snapshot and
+        # is only surfaced when the generation guard accepts this very plan.
         plan = _build_plan(batch, snap)
         stamp = _now()
         try:
@@ -374,6 +751,38 @@ def execute_batch(
 
 def get_generation(conn) -> int:
     return int(conn.execute("SELECT generation FROM store_meta WHERE id = 1").fetchone()[0])
+
+
+def list_aliases(conn) -> list:
+    from .schemas import AliasOut
+
+    return [
+        AliasOut(
+            alias_id=row["alias_id"],
+            canonical_id=row["canonical_id"],
+            created_at=row["created_at"],
+        )
+        for row in conn.execute(
+            "SELECT alias_id, canonical_id, created_at FROM point_aliases "
+            "ORDER BY alias_id"
+        )
+    ]
+
+
+def get_alias(conn, alias_id: str):
+    from .schemas import AliasOut
+
+    row = conn.execute(
+        "SELECT alias_id, canonical_id, created_at FROM point_aliases WHERE alias_id = ?",
+        (alias_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return AliasOut(
+        alias_id=row["alias_id"],
+        canonical_id=row["canonical_id"],
+        created_at=row["created_at"],
+    )
 
 
 def list_points(conn) -> list[PointIn]:
